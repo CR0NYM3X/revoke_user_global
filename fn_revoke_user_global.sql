@@ -17,6 +17,10 @@
  @Date: 23/01/2026
  @Change: Implementación de ejecución granular por comandos y logging dinámico.
  @Author: CR0NYM3X
+
+
+-------------
+Agregar para que revoke en todos los esquemas y no solamente en public
 */
 
 
