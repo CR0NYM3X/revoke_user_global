@@ -24,7 +24,7 @@ BEGIN
     RAISE NOTICE 'Iniciando proceso de revocación global...';
 
     -- ==========================================
-    -- NUEVA FASE: VALIDACIÓN PREVIA DE USUARIOS
+    -- FASE: VALIDACIÓN PREVIA DE USUARIOS
     -- ==========================================
     FOREACH v_user IN ARRAY v_users_to_revoke LOOP
         IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = v_user) THEN
@@ -35,7 +35,7 @@ BEGIN
         END IF;
     END LOOP;
 
-    -- Si no hay usuarios válidos, terminamos antes de hacer nada más
+    -- Si no hay usuarios válidos, terminamos
     IF array_length(v_users_valid, 1) IS NULL THEN
         RAISE NOTICE '------------------------------------------------------';
         RAISE NOTICE 'ABORTANDO: No se encontraron usuarios válidos para procesar.';
@@ -43,14 +43,14 @@ BEGIN
         RETURN;
     END IF;
 
-    -- Gestión de extensión dblink (Solo si hay usuarios válidos)
+    -- Gestión de extensión dblink
     IF NOT EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'dblink') THEN
         CREATE EXTENSION dblink;
         v_created_dblink := TRUE;
         RAISE NOTICE '>> Extensión dblink creada temporalmente.';
     END IF;
 
-    -- Obtener datos de red para dblink
+    -- Obtener datos de red
     SELECT replace(setting, ' ', '') INTO v_socket FROM pg_settings WHERE name = 'unix_socket_directories';
     SELECT setting INTO v_port FROM pg_settings WHERE name = 'port';
 
@@ -73,7 +73,7 @@ BEGIN
             BEGIN
                 PERFORM dblink_connect(v_db_conn_name, v_conn_str);
 
-                -- Ejecución de comandos de nivel Base de Datos
+                -- Comandos nivel Base de Datos
                 v_sql := format('REASSIGN OWNED BY %I TO postgres', v_user);
                 PERFORM dblink_exec(v_db_conn_name, v_sql);
                 RAISE NOTICE '   [OK] EXEC: %...', left(v_sql, 30);
@@ -82,7 +82,7 @@ BEGIN
                 PERFORM dblink_exec(v_db_conn_name, v_sql);
                 RAISE NOTICE '   [OK] EXEC: %...', left(v_sql, 30);
 
-                -- 4. Iterar por todos los Esquemas en la DB remota
+                -- 4. Iterar por todos los Esquemas
                 FOR v_schema IN 
                     SELECT s_name FROM dblink(v_db_conn_name, 
                         'SELECT nspname FROM pg_catalog.pg_namespace 
@@ -122,25 +122,36 @@ BEGIN
             END;
         END LOOP;
 
-        -- 5. Eliminar el rol si se solicitó
+        -- 5. Eliminar el rol y VALIDAR
         IF v_drop_user_final THEN
-            RAISE NOTICE '>> Eliminando rol % del cluster...', v_user;
-            EXECUTE format('DROP ROLE %I', v_user);
-            RAISE NOTICE '   [OK] Rol eliminado.';
+            RAISE NOTICE '>> Intentando eliminar rol % del cluster...', v_user;
+            BEGIN
+                EXECUTE format('DROP ROLE %I', v_user);
+                
+                -- VALIDACIÓN POST-DROP
+                IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = v_user) THEN
+                    RAISE NOTICE '>> [ERROR] El DROP ROLE % fue ejecutado pero el usuario SIGUE EXISTIENDO.', v_user;
+                ELSE
+                    RAISE NOTICE '   [OK] Rol % eliminado exitosamente.', v_user;
+                END IF;
+            EXCEPTION WHEN OTHERS THEN
+                GET STACKED DIAGNOSTICS v_error_msg = MESSAGE_TEXT;
+                RAISE NOTICE '>> [FALLO] No se pudo eliminar el usuario %: %', v_user, v_error_msg;
+            END;
         ELSE
-            RAISE NOTICE '>> El rol % se mantiene.', v_user;
+            RAISE NOTICE '>> El rol % se mantiene según configuración.', v_user;
         END IF;
 
     END LOOP;
 
-    -- Limpieza de dblink si fue creado por este script
+    -- Limpieza de dblink
     IF v_created_dblink THEN
         DROP EXTENSION dblink;
         RAISE NOTICE '>> Extensión dblink eliminada.';
     END IF;
 
     RAISE NOTICE '------------------------------------------------------';
-    RAISE NOTICE 'PROCESO COMPLETADO EXITOSAMENTE';
+    RAISE NOTICE 'PROCESO FINALIZADO';
     RAISE NOTICE '------------------------------------------------------';
 
 EXCEPTION WHEN OTHERS THEN
@@ -148,5 +159,5 @@ EXCEPTION WHEN OTHERS THEN
     IF dblink_get_connections() @> ARRAY[v_db_conn_name] THEN
         PERFORM dblink_disconnect(v_db_conn_name);
     END IF;
-    RAISE EXCEPTION 'Error crítico en el bloque anónimo: %', v_error_msg;
+    RAISE EXCEPTION 'Error crítico: %', v_error_msg;
 END $$;
