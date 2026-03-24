@@ -5,12 +5,13 @@ DECLARE
     -- ==========================================
     v_users_to_revoke TEXT[]  := ARRAY['jose', 'usuario_inexistente','maria']; 
     v_nologin_final   BOOLEAN := TRUE;          -- ¿Aplicar NOLOGIN al finalizar?
-    v_drop_user_final BOOLEAN := TRUE;         -- ¿Eliminar usuario al final?
+    v_drop_user_final BOOLEAN := FALSE;         -- ¿Eliminar usuario al final?
+    
     v_disable_hba     BOOLEAN := TRUE;          -- ¿Modificar pg_hba.conf de forma automática?
         v_folio       TEXT    := '123456';            -- Agregar folio para auditoria de pg_hba
     v_reload          BOOLEAN := FALSE;          -- Hacer reload 
 
-    v_detalle_notice BOOLEAN := TRUE;           -- Te imprime a detalle cada revoke ejecutado
+    v_detalle_notice BOOLEAN := FALSE;           -- Te imprime a detalle cada revoke ejecutado
 
     -- Variables de control
     v_user           TEXT;
