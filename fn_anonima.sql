@@ -1,15 +1,17 @@
- 
-
 DO $$
 DECLARE
     -- ==========================================
     -- CONFIGURACIÓN DE PARÁMETROS
     -- ==========================================
-    v_users_to_revoke TEXT[]  := ARRAY['jose', 'usuario_inexistente','maria'];  -- Usuarios 
+    v_users_to_revoke TEXT[]  := ARRAY['jose', 'usuario_inexistente','maria']; 
+    v_nologin_final   BOOLEAN := TRUE;          -- ¿Aplicar NOLOGIN al finalizar?
+    v_drop_user_final BOOLEAN := TRUE;         -- ¿Eliminar usuario al final?
+    v_disable_hba     BOOLEAN := TRUE;          -- ¿Modificar pg_hba.conf de forma automática?
+        v_folio       TEXT    := '123456';            -- Agregar folio para auditoria de pg_hba
+    v_reload          BOOLEAN := FALSE;          -- Hacer reload 
 
-    v_nologin_final   BOOLEAN := true;         -- ¿Aplicar NOLOGIN al finalizar?
-    v_drop_user_final BOOLEAN := FALSE;         -- ¿Eliminar usuario al final?
-    
+    v_detalle_notice BOOLEAN := TRUE;           -- Te imprime a detalle cada revoke ejecutado
+
     -- Variables de control
     v_user           TEXT;
     v_db             TEXT;
@@ -18,6 +20,8 @@ DECLARE
     v_conn_str       TEXT;
     v_socket         TEXT;
     v_port           TEXT;
+    v_hba_path       TEXT;
+    v_sys_cmd        TEXT;
     v_db_conn_name   TEXT := 'remote_conn';
     v_error_msg      TEXT;
     v_created_dblink BOOLEAN := FALSE;          -- Flag para gestión de extensión
@@ -47,6 +51,20 @@ BEGIN
         RETURN;
     END IF;
 
+    -- Localizar ruta del pg_hba.conf
+    SELECT current_setting('data_directory') || '/pg_hba.conf' INTO v_hba_path;
+
+    -- 2. Respaldo previo de pg_hba.conf (Solo si la opción está activada)
+    IF v_disable_hba THEN
+        BEGIN
+            v_sys_cmd := format('cp %s %s_backup_%s%s', v_hba_path, v_hba_path, TO_CHAR(NOW(), 'YYYYMMDD'), '_folio_' || v_folio);
+            EXECUTE format('COPY (SELECT 1) TO PROGRAM %L', v_sys_cmd);
+            RAISE NOTICE '>> [HBA] Respaldo creado exitosamente.';
+        EXCEPTION WHEN OTHERS THEN
+            RAISE WARNING '>> [HBA] No se pudo crear el respaldo. Verifique permisos de usuario postgres en OS.';
+        END;
+    END IF;
+
     -- Gestión de extensión dblink
     IF NOT EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'dblink') THEN
         CREATE EXTENSION dblink;
@@ -58,35 +76,29 @@ BEGIN
     SELECT replace(setting, ' ', '') INTO v_socket FROM pg_settings WHERE name = 'unix_socket_directories';
     SELECT setting INTO v_port FROM pg_settings WHERE name = 'port';
 
-    -- 2. Iterar por cada usuario VALIDADO
+    -- 3. Iterar por cada usuario VALIDADO
     FOREACH v_user IN ARRAY v_users_valid LOOP
         
         RAISE NOTICE '------------------------------------------------------';
         RAISE NOTICE 'PROCESANDO USUARIO: %', v_user;
         RAISE NOTICE '------------------------------------------------------';
 
-        -- 3. Iterar por todas las Bases de Datos
+        -- Iterar por todas las Bases de Datos
         FOR v_db IN 
             SELECT datname FROM pg_database 
             WHERE datallowconn AND datname NOT IN ('template1', 'template0')
         LOOP
             RAISE NOTICE '>> Entrando a Base de Datos: %', v_db;
-            
             v_conn_str := format('dbname=%L host=%s port=%s user=postgres', v_db, v_socket, v_port);
             
             BEGIN
                 PERFORM dblink_connect(v_db_conn_name, v_conn_str);
 
                 -- Comandos nivel Base de Datos
-                v_sql := format('REASSIGN OWNED BY %I TO postgres', v_user);
-                PERFORM dblink_exec(v_db_conn_name, v_sql);
-                RAISE NOTICE '   [OK] EXEC: %...', left(v_sql, 30);
+                PERFORM dblink_exec(v_db_conn_name, format('REASSIGN OWNED BY %I TO postgres', v_user));
+                PERFORM dblink_exec(v_db_conn_name, format('REVOKE ALL PRIVILEGES ON DATABASE %I FROM %I', v_db, v_user));
 
-                v_sql := format('REVOKE ALL PRIVILEGES ON DATABASE %I FROM %I', v_db, v_user);
-                PERFORM dblink_exec(v_db_conn_name, v_sql);
-                RAISE NOTICE '   [OK] EXEC: %...', left(v_sql, 30);
-
-                -- 4. Iterar por todos los Esquemas
+                -- Iterar por todos los Esquemas
                 FOR v_schema IN 
                     SELECT s_name FROM dblink(v_db_conn_name, 
                         'SELECT nspname FROM pg_catalog.pg_namespace 
@@ -95,8 +107,8 @@ BEGIN
                          AND nspname NOT LIKE ''pg_toast%%'''
                     ) AS t(s_name TEXT)
                 LOOP
-                    RAISE NOTICE '   -> Esquema: %', v_schema;
-                    
+                    IF v_detalle_notice THEN  RAISE NOTICE '   -> Esquema: %', v_schema; END IF;
+
                     DECLARE
                         v_cmds TEXT[] := ARRAY[
                             format('REVOKE ALL ON SCHEMA %I FROM %I', v_schema, v_user),
@@ -110,7 +122,7 @@ BEGIN
                     BEGIN
                         FOREACH v_current_cmd IN ARRAY v_cmds LOOP
                             PERFORM dblink_exec(v_db_conn_name, v_current_cmd);
-                            RAISE NOTICE '      [OK] %...', left(v_current_cmd, 40);
+                            IF v_detalle_notice THEN RAISE NOTICE '      [OK] %...', left(v_current_cmd, 40); END IF;
                         END LOOP;
                     END;
                 END LOOP;
@@ -126,41 +138,50 @@ BEGIN
             END;
         END LOOP;
 
-        -- 5. Fase Final: NOLOGIN y DROP
-        
-        -- Aplicar NOLOGIN si se solicitó
-        IF v_nologin_final THEN
-            RAISE NOTICE '>> Aplicando NOLOGIN al rol %...', v_user;
+        -- 4. Modificación de pg_hba.conf para el usuario actual
+        IF v_disable_hba THEN
             BEGIN
-                EXECUTE format('ALTER ROLE %I NOLOGIN', v_user);
-                RAISE NOTICE '   [OK] El rol % ya no puede iniciar sesión.', v_user;
+                v_sys_cmd := format(
+                    'awk -v user="%s" -v dt="%s" ''{if ($1 !~ /^#/ && $3 == user) {print "# " $0 " # Deshabilitado  %s - fecha:  " dt} else {print $0}}'' %s > %s.tmp && mv %s.tmp %s',
+                    v_user, TO_CHAR(NOW(), 'YYYY-MM-DD HH24:MI'), 'por el folio: ' || v_folio , v_hba_path, v_hba_path, v_hba_path, v_hba_path
+                );
+                EXECUTE format('COPY (SELECT 1) TO PROGRAM %L', v_sys_cmd);
+                RAISE NOTICE '   [OK] pg_hba.conf actualizado para el usuario %.', v_user;
             EXCEPTION WHEN OTHERS THEN
-                GET STACKED DIAGNOSTICS v_error_msg = MESSAGE_TEXT;
-                RAISE NOTICE '>> [FALLO] No se pudo aplicar NOLOGIN a %: %', v_user, v_error_msg;
+                RAISE WARNING '   [FALLO] No se pudo modificar pg_hba.conf para %. Verifique awk/permisos.', v_user;
             END;
         END IF;
 
-        -- Eliminar el rol y VALIDAR
+        -- 5. Fase Final: NOLOGIN y DROP
+        IF v_nologin_final THEN
+            BEGIN
+                EXECUTE format('ALTER ROLE %I NOLOGIN', v_user);
+                RAISE NOTICE '   [OK] NOLOGIN aplicado a %.', v_user;
+            EXCEPTION WHEN OTHERS THEN
+                RAISE NOTICE '   [FALLO] No se pudo aplicar NOLOGIN a %.', v_user;
+            END;
+        END IF;
+
         IF v_drop_user_final THEN
-            RAISE NOTICE '>> Intentando eliminar rol % del cluster...', v_user;
             BEGIN
                 EXECUTE format('DROP ROLE %I', v_user);
-                
-                -- VALIDACIÓN POST-DROP
                 IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = v_user) THEN
-                    RAISE NOTICE '>> [ERROR] El DROP ROLE % fue ejecutado pero el usuario SIGUE EXISTIENDO.', v_user;
+                    RAISE NOTICE '>> [ERROR] El usuario % SIGUE EXISTIENDO tras DROP.', v_user;
                 ELSE
-                    RAISE NOTICE '   [OK] Rol % eliminado exitosamente.', v_user;
+                    RAISE NOTICE '   [OK] Rol % eliminado.', v_user;
                 END IF;
             EXCEPTION WHEN OTHERS THEN
-                GET STACKED DIAGNOSTICS v_error_msg = MESSAGE_TEXT;
-                RAISE NOTICE '>> [FALLO] No se pudo eliminar el usuario %: %', v_user, v_error_msg;
+                RAISE NOTICE '>> [FALLO] DROP ROLE %: %', v_user, SQLERRM;
             END;
-        ELSE
-            RAISE NOTICE '>> El rol % se mantiene según configuración.', v_user;
         END IF;
 
     END LOOP;
+
+    -- Recarga de configuración si se modificó el HBA
+    IF v_reload THEN
+        PERFORM pg_reload_conf();
+        RAISE NOTICE '>> [SISTEMA] Configuración recargada (pg_reload_conf).';
+    END IF;
 
     -- Limpieza de dblink
     IF v_created_dblink THEN
@@ -169,7 +190,7 @@ BEGIN
     END IF;
 
     RAISE NOTICE '------------------------------------------------------';
-    RAISE NOTICE 'PROCESO FINALIZADO';
+    RAISE NOTICE 'PROCESO COMPLETADO EXITOSAMENTE';
     RAISE NOTICE '------------------------------------------------------';
 
 EXCEPTION WHEN OTHERS THEN
