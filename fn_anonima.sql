@@ -1,10 +1,14 @@
+ 
+
 DO $$
 DECLARE
     -- ==========================================
     -- CONFIGURACIÓN DE PARÁMETROS
     -- ==========================================
-    v_users_to_revoke TEXT[]  := ARRAY['jose', 'usuario_inexistente','maria']; -- Usuarios objetivo
-    v_drop_user_final BOOLEAN := true;         -- ¿Eliminar usuario al final?
+    v_users_to_revoke TEXT[]  := ARRAY['jose', 'usuario_inexistente','maria'];  -- Usuarios 
+
+    v_nologin_final   BOOLEAN := true;         -- ¿Aplicar NOLOGIN al finalizar?
+    v_drop_user_final BOOLEAN := FALSE;         -- ¿Eliminar usuario al final?
     
     -- Variables de control
     v_user           TEXT;
@@ -122,7 +126,21 @@ BEGIN
             END;
         END LOOP;
 
-        -- 5. Eliminar el rol y VALIDAR
+        -- 5. Fase Final: NOLOGIN y DROP
+        
+        -- Aplicar NOLOGIN si se solicitó
+        IF v_nologin_final THEN
+            RAISE NOTICE '>> Aplicando NOLOGIN al rol %...', v_user;
+            BEGIN
+                EXECUTE format('ALTER ROLE %I NOLOGIN', v_user);
+                RAISE NOTICE '   [OK] El rol % ya no puede iniciar sesión.', v_user;
+            EXCEPTION WHEN OTHERS THEN
+                GET STACKED DIAGNOSTICS v_error_msg = MESSAGE_TEXT;
+                RAISE NOTICE '>> [FALLO] No se pudo aplicar NOLOGIN a %: %', v_user, v_error_msg;
+            END;
+        END IF;
+
+        -- Eliminar el rol y VALIDAR
         IF v_drop_user_final THEN
             RAISE NOTICE '>> Intentando eliminar rol % del cluster...', v_user;
             BEGIN
