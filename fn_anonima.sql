@@ -62,7 +62,7 @@ BEGIN
             EXECUTE format('COPY (SELECT 1) TO PROGRAM %L', v_sys_cmd);
             RAISE NOTICE '>> [HBA] Respaldo creado exitosamente.';
         EXCEPTION WHEN OTHERS THEN
-            RAISE WARNING '>> [HBA] No se pudo crear el respaldo. Verifique permisos de usuario postgres en OS.';
+            RAISE EXCEPTION '>> [HBA] No se pudo crear el respaldo. Verifique permisos de usuario postgres en OS.';
         END;
     END IF;
 
