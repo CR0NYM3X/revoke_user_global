@@ -1,4 +1,5 @@
 
+
 DO $$
 DECLARE
     -- ==========================================
@@ -6,7 +7,7 @@ DECLARE
     -- ==========================================
     v_users_to_revoke TEXT[]  := ARRAY['jose', 'usuario_inexistente','maria', 'jose']; 
     v_nologin_final   BOOLEAN := TRUE;          -- ¿Aplicar NOLOGIN al finalizar?
-    v_execute_revokes BOOLEAN := FALSE;          -- ¿Ejecutar revocación de privilegios (REVOKE/REASSIGN)?
+    v_execute_revokes BOOLEAN := FALSE;         -- ¿Ejecutar revocación de privilegios (REVOKE/REASSIGN)?
     
     v_drop_user_final BOOLEAN := FALSE;         -- ¿Eliminar usuario al final?
 
@@ -31,6 +32,12 @@ DECLARE
     v_error_msg      TEXT;
     v_created_dblink BOOLEAN := FALSE;          -- Flag para gestión de extensión
     v_users_valid    TEXT[]  := ARRAY[]::TEXT[]; -- Lista filtrada de usuarios que sí existen
+
+    -- NUEVAS VARIABLES INTEGRADAS DE FN24
+    v_regex_pattern  TEXT;
+    v_res_user       TEXT;
+    v_res_func       TEXT;
+    v_users_to_skip  TEXT[] := ARRAY[]::TEXT[]; -- Usuarios encontrados en funciones que no se deben tocar
 BEGIN
     -- 1. Configurar nivel de verbosidad
     SET client_min_messages = notice;
@@ -83,6 +90,57 @@ BEGIN
     -- Obtener datos de red
     SELECT replace(setting, ' ', '') INTO v_socket FROM pg_settings WHERE name = 'unix_socket_directories';
     SELECT setting INTO v_port FROM pg_settings WHERE name = 'port';
+
+    -- ==========================================
+    -- INTEGRACIÓN FUNCIONALIDAD FN24: ESCANEO DE FUNCIONES
+    -- ==========================================
+    v_regex_pattern := array_to_string(v_users_valid, '|');
+    RAISE NOTICE '>> [SEGURIDAD] Escaneando definiciones de funciones para el patrón: (%)', v_regex_pattern;
+
+    FOR v_db IN 
+        SELECT datname FROM pg_database 
+        WHERE datallowconn AND NOT datistemplate AND datname NOT IN ('template1', 'template0')
+    LOOP
+        v_conn_str := format('dbname=%L host=%s port=%s user=postgres', v_db, v_socket, v_port);
+        BEGIN
+            PERFORM dblink_connect(v_db_conn_name, v_conn_str);
+
+            FOR v_res_user, v_res_func IN 
+                SELECT t.u_match, t.f_name FROM dblink(v_db_conn_name, 
+                    format($QUERY$
+                        SELECT 
+                            (regexp_matches(p.prosrc, %L, 'i'))[1],
+                            n.nspname || '.' || p.proname           
+                        FROM pg_proc p
+                        JOIN pg_namespace n ON n.oid = p.pronamespace
+                        WHERE p.prosrc ~* %L                        
+                          AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+                    $QUERY$, v_regex_pattern, v_regex_pattern)
+                ) AS t(u_match TEXT, f_name TEXT)
+            LOOP
+                RAISE WARNING '!!! [ALERTA] DB: % | Usuario "%" encontrado en función: %', v_db, v_res_user, v_res_func;
+                -- RAISE WARNING '!!! [BLOQUEO] El usuario % no se podrá trabajar por seguridad.', v_res_user;
+                v_users_to_skip := array_append(v_users_to_skip, v_res_user);
+            END LOOP;
+
+            PERFORM dblink_disconnect(v_db_conn_name);
+        EXCEPTION WHEN OTHERS THEN
+            IF dblink_get_connections() @> ARRAY[v_db_conn_name] THEN PERFORM dblink_disconnect(v_db_conn_name); END IF;
+        END;
+    END LOOP;
+
+    -- Filtrar la lista final de usuarios removiendo los encontrados en funciones
+    SELECT ARRAY_AGG(u) INTO v_users_valid 
+    FROM unnest(v_users_valid) u 
+    WHERE u NOT IN (SELECT unnest(v_users_to_skip));
+
+    IF v_users_valid IS NULL OR array_length(v_users_valid, 1) IS NULL THEN
+        RAISE NOTICE '------------------------------------------------------';
+        RAISE NOTICE 'ABORTANDO: Todos los usuarios están presentes en funciones y han sido omitidos.';
+        RAISE NOTICE '------------------------------------------------------';
+        IF v_created_dblink THEN DROP EXTENSION dblink; END IF;
+        RETURN;
+    END IF;
 
     -- 3. Iterar por cada usuario VALIDADO
     FOREACH v_user IN ARRAY v_users_valid LOOP
