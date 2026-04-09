@@ -1,15 +1,19 @@
+
 DO $$
 DECLARE
     -- ==========================================
     -- CONFIGURACIÓN DE PARÁMETROS
     -- ==========================================
-    v_users_to_revoke TEXT[]  := ARRAY['jose', 'usuario_inexistente','maria']; 
+    v_users_to_revoke TEXT[]  := ARRAY['jose', 'usuario_inexistente','maria', 'jose']; 
     v_nologin_final   BOOLEAN := TRUE;          -- ¿Aplicar NOLOGIN al finalizar?
-    v_drop_user_final BOOLEAN := FALSE;         -- ¿Eliminar usuario al final?
+    v_execute_revokes BOOLEAN := FALSE;          -- ¿Ejecutar revocación de privilegios (REVOKE/REASSIGN)?
     
+    v_drop_user_final BOOLEAN := FALSE;         -- ¿Eliminar usuario al final?
+
     v_disable_hba     BOOLEAN := TRUE;          -- ¿Modificar pg_hba.conf de forma automática?
-        v_folio       TEXT    := '123456';            -- Agregar folio para auditoria de pg_hba
-    v_reload          BOOLEAN := FALSE;          -- Hacer reload 
+        v_backup_hba  BOOLEAN := TRUE;          -- ¿Quieres hacer Backup de pg_hba.conf?
+        v_folio       TEXT    := '123456';      -- Agregar folio para auditoria de pg_hba
+    v_reload          BOOLEAN := FALSE;         -- Hacer reload 
 
     v_detalle_notice BOOLEAN := FALSE;           -- Te imprime a detalle cada revoke ejecutado
 
@@ -35,7 +39,10 @@ BEGIN
     -- ==========================================
     -- FASE: VALIDACIÓN PREVIA DE USUARIOS
     -- ==========================================
-    FOREACH v_user IN ARRAY v_users_to_revoke LOOP
+    -- Filtrar usuarios únicos y existentes
+    FOR v_user IN 
+        SELECT DISTINCT unnest(v_users_to_revoke) 
+    LOOP
         IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = v_user) THEN
             v_users_valid := array_append(v_users_valid, v_user);
             RAISE NOTICE '>> [VALIDACIÓN] Usuario % verificado y listo.', v_user;
@@ -56,7 +63,7 @@ BEGIN
     SELECT current_setting('data_directory') || '/pg_hba.conf' INTO v_hba_path;
 
     -- 2. Respaldo previo de pg_hba.conf (Solo si la opción está activada)
-    IF v_disable_hba THEN
+    IF v_disable_hba AND v_backup_hba THEN
         BEGIN
             v_sys_cmd := format('cp %s %s_backup_%s%s', v_hba_path, v_hba_path, TO_CHAR(NOW(), 'YYYYMMDD'), '_folio_' || v_folio);
             EXECUTE format('COPY (SELECT 1) TO PROGRAM %L', v_sys_cmd);
@@ -84,60 +91,65 @@ BEGIN
         RAISE NOTICE 'PROCESANDO USUARIO: %', v_user;
         RAISE NOTICE '------------------------------------------------------';
 
-        -- Iterar por todas las Bases de Datos
-        FOR v_db IN 
-            SELECT datname FROM pg_database 
-            WHERE datallowconn AND datname NOT IN ('template1', 'template0')
-        LOOP
-            RAISE NOTICE '>> Entrando a Base de Datos: %', v_db;
-            v_conn_str := format('dbname=%L host=%s port=%s user=postgres', v_db, v_socket, v_port);
-            
-            BEGIN
-                PERFORM dblink_connect(v_db_conn_name, v_conn_str);
+        -- Bloque de Revocación de privilegios (Opcional)
+        IF v_execute_revokes THEN
+            -- Iterar por todas las Bases de Datos
+            FOR v_db IN 
+                SELECT datname FROM pg_database 
+                WHERE datallowconn AND datname NOT IN ('template1', 'template0')
+            LOOP
+                RAISE NOTICE '>> Entrando a Base de Datos: %', v_db;
+                v_conn_str := format('dbname=%L host=%s port=%s user=postgres', v_db, v_socket, v_port);
+                
+                BEGIN
+                    PERFORM dblink_connect(v_db_conn_name, v_conn_str);
 
-                -- Comandos nivel Base de Datos
-                PERFORM dblink_exec(v_db_conn_name, format('REASSIGN OWNED BY %I TO postgres', v_user));
-                PERFORM dblink_exec(v_db_conn_name, format('REVOKE ALL PRIVILEGES ON DATABASE %I FROM %I', v_db, v_user));
+                    -- Comandos nivel Base de Datos
+                    PERFORM dblink_exec(v_db_conn_name, format('REASSIGN OWNED BY %I TO postgres', v_user));
+                    PERFORM dblink_exec(v_db_conn_name, format('REVOKE ALL PRIVILEGES ON DATABASE %I FROM %I', v_db, v_user));
 
-                -- Iterar por todos los Esquemas
-                FOR v_schema IN 
-                    SELECT s_name FROM dblink(v_db_conn_name, 
-                        'SELECT nspname FROM pg_catalog.pg_namespace 
-                         WHERE nspname NOT IN (''information_schema'', ''pg_catalog'', ''datadog'') 
-                         AND nspname NOT LIKE ''pg_temp%%'' 
-                         AND nspname NOT LIKE ''pg_toast%%'''
-                    ) AS t(s_name TEXT)
-                LOOP
-                    IF v_detalle_notice THEN  RAISE NOTICE '   -> Esquema: %', v_schema; END IF;
+                    -- Iterar por todos los Esquemas
+                    FOR v_schema IN 
+                        SELECT s_name FROM dblink(v_db_conn_name, 
+                            'SELECT nspname FROM pg_catalog.pg_namespace 
+                             WHERE nspname NOT IN (''information_schema'', ''pg_catalog'', ''datadog'') 
+                             AND nspname NOT LIKE ''pg_temp%%'' 
+                             AND nspname NOT LIKE ''pg_toast%%'''
+                        ) AS t(s_name TEXT)
+                    LOOP
+                        IF v_detalle_notice THEN  RAISE NOTICE '   -> Esquema: %', v_schema; END IF;
 
-                    DECLARE
-                        v_cmds TEXT[] := ARRAY[
-                            format('REVOKE ALL ON SCHEMA %I FROM %I', v_schema, v_user),
-                            format('REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA %I FROM %I', v_schema, v_user),
-                            format('REVOKE ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA %I FROM %I', v_schema, v_user),
-                            format('REVOKE ALL PRIVILEGES ON ALL FUNCTIONS IN SCHEMA %I FROM %I', v_schema, v_user),
-                            format('ALTER DEFAULT PRIVILEGES IN SCHEMA %I REVOKE ALL ON TABLES FROM %I', v_schema, v_user),
-                            format('ALTER DEFAULT PRIVILEGES IN SCHEMA %I REVOKE ALL ON SEQUENCES FROM %I', v_schema, v_user)
-                        ];
-                        v_current_cmd TEXT;
-                    BEGIN
-                        FOREACH v_current_cmd IN ARRAY v_cmds LOOP
-                            PERFORM dblink_exec(v_db_conn_name, v_current_cmd);
-                            IF v_detalle_notice THEN RAISE NOTICE '      [OK] %...', left(v_current_cmd, 40); END IF;
-                        END LOOP;
-                    END;
-                END LOOP;
+                        DECLARE
+                            v_cmds TEXT[] := ARRAY[
+                                format('REVOKE ALL ON SCHEMA %I FROM %I', v_schema, v_user),
+                                format('REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA %I FROM %I', v_schema, v_user),
+                                format('REVOKE ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA %I FROM %I', v_schema, v_user),
+                                format('REVOKE ALL PRIVILEGES ON ALL FUNCTIONS IN SCHEMA %I FROM %I', v_schema, v_user),
+                                format('ALTER DEFAULT PRIVILEGES IN SCHEMA %I REVOKE ALL ON TABLES FROM %I', v_schema, v_user),
+                                format('ALTER DEFAULT PRIVILEGES IN SCHEMA %I REVOKE ALL ON SEQUENCES FROM %I', v_schema, v_user)
+                            ];
+                            v_current_cmd TEXT;
+                        BEGIN
+                            FOREACH v_current_cmd IN ARRAY v_cmds LOOP
+                                PERFORM dblink_exec(v_db_conn_name, v_current_cmd);
+                                IF v_detalle_notice THEN RAISE NOTICE '      [OK] %...', left(v_current_cmd, 40); END IF;
+                            END LOOP;
+                        END;
+                    END LOOP;
 
-                PERFORM dblink_disconnect(v_db_conn_name);
-
-            EXCEPTION WHEN OTHERS THEN
-                GET STACKED DIAGNOSTICS v_error_msg = MESSAGE_TEXT;
-                RAISE WARNING 'Error procesando DB %: %', v_db, v_error_msg;
-                IF dblink_get_connections() @> ARRAY[v_db_conn_name] THEN
                     PERFORM dblink_disconnect(v_db_conn_name);
-                END IF;
-            END;
-        END LOOP;
+
+                EXCEPTION WHEN OTHERS THEN
+                    GET STACKED DIAGNOSTICS v_error_msg = MESSAGE_TEXT;
+                    RAISE WARNING 'Error procesando DB %: %', v_db, v_error_msg;
+                    IF dblink_get_connections() @> ARRAY[v_db_conn_name] THEN
+                        PERFORM dblink_disconnect(v_db_conn_name);
+                    END IF;
+                END;
+            END LOOP;
+        ELSE
+            RAISE NOTICE '>> [INFO] Se omite revocación de privilegios según v_execute_revokes.';
+        END IF;
 
         -- 4. Modificación de pg_hba.conf para el usuario actual
         IF v_disable_hba THEN
