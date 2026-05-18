@@ -5,14 +5,16 @@ DECLARE
     -- ==========================================
     -- CONFIGURACIÓN DE PARÁMETROS
     -- ==========================================
-    v_users_to_revoke TEXT[]  := ARRAY['jose', 'usuario_inexistente','maria', 'jose']; 
+    v_users_to_revoke TEXT[]  := ARRAY['jose', 'usuario_inexistente','maria', 'jose','admin_externo']; 
+    v_check_user_funtion  BOOLEAN := TRUE;          -- Validar si un usuario esta en la definicion de una funcion
+
     v_nologin_final   BOOLEAN := TRUE;          -- ¿Aplicar NOLOGIN al finalizar?
     v_execute_revokes BOOLEAN := FALSE;         -- ¿Ejecutar revocación de privilegios (REVOKE/REASSIGN)?
     
     v_drop_user_final BOOLEAN := FALSE;         -- ¿Eliminar usuario al final?
 
-    v_disable_hba     BOOLEAN := TRUE;          -- ¿Modificar pg_hba.conf de forma automática?
-        v_backup_hba  BOOLEAN := TRUE;          -- ¿Quieres hacer Backup de pg_hba.conf?
+    v_disable_hba     BOOLEAN := FALSE;          -- ¿Modificar pg_hba.conf de forma automática?
+        v_backup_hba  BOOLEAN := FALSE;          -- ¿Quieres hacer Backup de pg_hba.conf?
         v_folio       TEXT    := '123456';      -- Agregar folio para auditoria de pg_hba
     v_reload          BOOLEAN := FALSE;         -- Hacer reload 
 
@@ -91,43 +93,49 @@ BEGIN
     SELECT replace(setting, ' ', '') INTO v_socket FROM pg_settings WHERE name = 'unix_socket_directories';
     SELECT setting INTO v_port FROM pg_settings WHERE name = 'port';
 
-    -- ==========================================
-    -- INTEGRACIÓN FUNCIONALIDAD FN24: ESCANEO DE FUNCIONES
-    -- ==========================================
-    v_regex_pattern := array_to_string(v_users_valid, '|');
-    RAISE NOTICE '>> [SEGURIDAD] Escaneando definiciones de funciones para el patrón: (%)', v_regex_pattern;
 
-    FOR v_db IN 
-        SELECT datname FROM pg_database 
-        WHERE datallowconn AND NOT datistemplate AND datname NOT IN ('template1', 'template0')
-    LOOP
-        v_conn_str := format('dbname=%L host=%s port=%s user=postgres', v_db, v_socket, v_port);
-        BEGIN
-            PERFORM dblink_connect(v_db_conn_name, v_conn_str);
+    IF v_check_user_funtion THEN
+        -- ==========================================
+        -- INTEGRACIÓN FUNCIONALIDAD FN24: ESCANEO DE FUNCIONES
+        -- ==========================================
+        v_regex_pattern := array_to_string(v_users_valid, '|');
+        RAISE NOTICE '>> [SEGURIDAD] Escaneando definiciones de funciones para el patrón: (%)', v_regex_pattern;
 
-            FOR v_res_user, v_res_func IN 
-                SELECT t.u_match, t.f_name FROM dblink(v_db_conn_name, 
-                    format($QUERY$
-                        SELECT 
-                            (regexp_matches(p.prosrc, %L, 'i'))[1],
-                            n.nspname || '.' || p.proname           
-                        FROM pg_proc p
-                        JOIN pg_namespace n ON n.oid = p.pronamespace
-                        WHERE p.prosrc ~* %L                        
-                          AND n.nspname NOT IN ('pg_catalog', 'information_schema')
-                    $QUERY$, v_regex_pattern, v_regex_pattern)
-                ) AS t(u_match TEXT, f_name TEXT)
-            LOOP
-                RAISE WARNING '!!! [ALERTA] DB: % | Usuario "%" encontrado en función: %', v_db, v_res_user, v_res_func;
-                -- RAISE WARNING '!!! [BLOQUEO] El usuario % no se podrá trabajar por seguridad.', v_res_user;
-                v_users_to_skip := array_append(v_users_to_skip, v_res_user);
-            END LOOP;
+        FOR v_db IN 
+            SELECT datname FROM pg_database 
+            WHERE datallowconn AND NOT datistemplate AND datname NOT IN ('template1', 'template0')
+        LOOP
+            v_conn_str := format('dbname=%L host=%s port=%s user=postgres', v_db, v_socket, v_port);
+            BEGIN
+                PERFORM dblink_connect(v_db_conn_name, v_conn_str);
 
-            PERFORM dblink_disconnect(v_db_conn_name);
-        EXCEPTION WHEN OTHERS THEN
-            IF dblink_get_connections() @> ARRAY[v_db_conn_name] THEN PERFORM dblink_disconnect(v_db_conn_name); END IF;
-        END;
-    END LOOP;
+                FOR v_res_user, v_res_func IN 
+                    SELECT t.u_match, t.f_name FROM dblink(v_db_conn_name, 
+                        format($QUERY$
+                            SELECT 
+                                (regexp_matches(p.prosrc, %L, 'i'))[1],
+                                n.nspname || '.' || p.proname           
+                            FROM pg_proc p
+                            JOIN pg_namespace n ON n.oid = p.pronamespace
+                            WHERE p.prosrc ~* %L                        
+                            AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+                        $QUERY$, v_regex_pattern, v_regex_pattern)
+                    ) AS t(u_match TEXT, f_name TEXT)
+                LOOP
+                    RAISE WARNING '!!! [ALERTA] DB: % | Usuario "%" encontrado en función: %', v_db, v_res_user, v_res_func;
+                    -- RAISE WARNING '!!! [BLOQUEO] El usuario % no se podrá trabajar por seguridad.', v_res_user;
+                    v_users_to_skip := array_append(v_users_to_skip, v_res_user);
+                END LOOP;
+
+                PERFORM dblink_disconnect(v_db_conn_name);
+            EXCEPTION WHEN OTHERS THEN
+                IF dblink_get_connections() @> ARRAY[v_db_conn_name] THEN PERFORM dblink_disconnect(v_db_conn_name); END IF;
+            END;
+        END LOOP;
+    END IF;
+
+
+ 
 
     -- Filtrar la lista final de usuarios removiendo los encontrados en funciones
     SELECT ARRAY_AGG(u) INTO v_users_valid 
@@ -259,6 +267,11 @@ BEGIN
         DROP EXTENSION dblink;
         RAISE NOTICE '>> Extensión dblink eliminada.';
     END IF;
+
+    RAISE NOTICE '------------------------------------------------------';
+    RAISE NOTICE 'CONSULTA LA SIGUIENTE QUERY';
+    RAISE NOTICE '------------------------------------------------------';    
+    RAISE NOTICE E' select rolname,rolsuper,rolconnlimit,rolcanlogin,rolvaliduntil from pg_authid where rolname in(select * from unnest(\'%\'::text[])); ', v_users_to_revoke;
 
     RAISE NOTICE '------------------------------------------------------';
     RAISE NOTICE 'PROCESO COMPLETADO EXITOSAMENTE';
