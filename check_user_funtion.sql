@@ -101,6 +101,10 @@ create database test102;
 create database test103;
 
 
+create user jose;
+create user maria;
+create user admin_externo;
+
 \c test101
 
 -- 1. Creamos un esquema de pruebas para no ensuciar el public
