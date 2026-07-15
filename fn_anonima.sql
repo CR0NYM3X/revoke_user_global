@@ -118,7 +118,7 @@ BEGIN
                             FROM pg_proc p
                             JOIN pg_namespace n ON n.oid = p.pronamespace
                             WHERE p.prosrc ~* %L                        
-                            --AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+                            AND n.nspname NOT IN ('pg_catalog', 'information_schema')
                         $QUERY$, v_regex_pattern, v_regex_pattern)
                     ) AS t(u_match TEXT, f_name TEXT)
                 LOOP
@@ -178,8 +178,8 @@ BEGIN
                     FOR v_schema IN 
                         SELECT s_name FROM dblink(v_db_conn_name, 
                             'SELECT nspname FROM pg_catalog.pg_namespace 
-                             WHERE nspname NOT IN (''information_schema'', ''pg_catalog'', ''datadog'') 
-                             AND nspname NOT LIKE ''pg_temp%%'' 
+                             WHERE /*nspname NOT IN (''information_schema'', ''pg_catalog'', ''datadog'') 
+                             AND*/ nspname NOT LIKE ''pg_temp%%'' 
                              AND nspname NOT LIKE ''pg_toast%%'''
                         ) AS t(s_name TEXT)
                     LOOP
