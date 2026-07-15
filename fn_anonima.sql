@@ -118,7 +118,7 @@ BEGIN
                             FROM pg_proc p
                             JOIN pg_namespace n ON n.oid = p.pronamespace
                             WHERE p.prosrc ~* %L                        
-                            AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+                            --AND n.nspname NOT IN ('pg_catalog', 'information_schema')
                         $QUERY$, v_regex_pattern, v_regex_pattern)
                     ) AS t(u_match TEXT, f_name TEXT)
                 LOOP
